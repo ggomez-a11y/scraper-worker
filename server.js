@@ -1,5 +1,8 @@
 import express from 'express';
-import { chromium } from 'playwright';
+
+// IMPORTANT: tell Playwright to use the browsers baked into the Docker image
+process.env.PLAYWRIGHT_BROWSERS_PATH = '/ms-playwright';
+process.env.PLAYWRIGHT_SKIP_DOWNLOAD = '1';
 
 const app = express();
 
@@ -15,7 +18,6 @@ app.get('/scrape', async (req, res) => {
     const data = await runScrape(isbn);
     res.json(data);
   } catch (e) {
-    // Return the error message so you don't have to dig through logs
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
@@ -26,6 +28,9 @@ app.listen(PORT, HOST, () => console.log(`server listening on http://${HOST}:${P
 
 // ---------------- SCRAPER (robust + fast) ----------------
 async function runScrape(isbn) {
+  // Dynamically import Playwright AFTER env vars are set
+  const { chromium } = await import('playwright');
+
   // 1) Launch browser (safe flags for containers)
   let browser;
   try {
@@ -43,7 +48,6 @@ async function runScrape(isbn) {
   });
   const page = await context.newPage();
 
-  // 2) Small helpers
   const clean = (s) => (s ? String(s).replace(/\s+/g, ' ').trim() : null);
   const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
   const fmtISO = (iso) => {
@@ -54,7 +58,6 @@ async function runScrape(isbn) {
     return y || null;
   };
 
-  // 3) Block heavy assets for speed
   await page.route('**/*', (route) => {
     const url = route.request().url();
     if (/\.(css|jpg|jpeg|png|svg|gif|woff2?)($|\?)/i.test(url)) route.abort();
@@ -62,18 +65,15 @@ async function runScrape(isbn) {
   });
 
   try {
-    // 4) Go to Goodreads search
     await page.goto(`https://www.goodreads.com/search?q=${encodeURIComponent(isbn)}`, {
       timeout: 30000,
       waitUntil: 'domcontentloaded',
     });
 
-    // close any overlay if present
     try {
       await page.locator('[class*="Overlay__close"], button[aria-label="Close"]').first().click({ timeout: 3500 });
     } catch {}
 
-    // 5) If on search results, click the first book
     if (!page.url().includes('/book/show/')) {
       const first = page.locator('a[href*="/book/show/"]:not([href*="/reviews"])').first();
       await first.waitFor({ state: 'visible', timeout: 10000 });
@@ -81,7 +81,6 @@ async function runScrape(isbn) {
       await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
     }
 
-    // 6) Try to open the details drawer (background)
     const openDetails = (async () => {
       const visible = await page
         .locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]')
@@ -108,7 +107,6 @@ async function runScrape(isbn) {
       return false;
     })();
 
-    // 7) Collect core fields (fast)
     const [
       title, author, ratingValue, ratingsCountText, descriptionRaw, genres,
       formatText, language, seriesText, ogCover, ldjsonScripts,
@@ -131,10 +129,9 @@ async function runScrape(isbn) {
       page.locator('[data-testid="bookPageTitleSection"] h3').first().textContent({ timeout: 800 }).catch(() => null),
     ]);
 
-    // subtitle
     let subtitle = clean(sub1) || clean(sub2) || clean(sub3) || clean(sub4);
 
-    // 8) JSON-LD fallback for publishedfull
+    // JSON-LD → publishedfull
     let publishedfull = null;
     try {
       const blobs = (ldjsonScripts || []).map(t => { try { return JSON.parse(t); } catch { return null; } }).filter(Boolean);
@@ -158,7 +155,6 @@ async function runScrape(isbn) {
       }
     } catch {}
 
-    // 9) Wait up to 1s for details drawer (then read dt/dd)
     await Promise.race([openDetails, new Promise(r => setTimeout(r, 1000))]);
 
     const [originaltitleRaw, publishedCandidates] = await Promise.all([
@@ -184,7 +180,6 @@ async function runScrape(isbn) {
       } catch {}
     }
 
-    // 10) Assemble result
     const details = {
       isbn,
       title: clean(title),
