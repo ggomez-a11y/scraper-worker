@@ -3,10 +3,10 @@ import { chromium } from 'playwright';
 
 const app = express();
 
-// health check
+// Health
 app.get('/', (_req, res) => res.send('OK - scraper server running'));
 
-// GET /scrape?isbn=9781847399960
+// One simple endpoint: /scrape?isbn=9781847399960
 app.get('/scrape', async (req, res) => {
   const isbn = String(req.query.isbn || '').trim();
   if (!isbn) return res.status(400).json({ error: 'Missing ?isbn=' });
@@ -15,33 +15,46 @@ app.get('/scrape', async (req, res) => {
     const data = await runScrape(isbn);
     res.json(data);
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: String(e.message || e) });
+    // Return the error message so you don't have to dig through logs
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`server listening on port ${PORT}`));
+const HOST = '0.0.0.0';
+app.listen(PORT, HOST, () => console.log(`server listening on http://${HOST}:${PORT}`));
 
-// ------------ scraper ------------
+// ---------------- SCRAPER (robust + fast) ----------------
 async function runScrape(isbn) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  // 1) Launch browser (safe flags for containers)
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+  } catch (err) {
+    throw new Error('Failed to launch Chromium: ' + (err?.message || err));
+  }
+
+  const context = await browser.newContext({
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
   });
-  const context = await browser.newContext();
   const page = await context.newPage();
 
+  // 2) Small helpers
   const clean = (s) => (s ? String(s).replace(/\s+/g, ' ').trim() : null);
-  const month = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
   const fmtISO = (iso) => {
     const m = String(iso||'').match(/^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$/);
     if (!m) return null; const [,y,mm,dd]=m;
-    if (y && mm && dd) return `${month[+mm-1]} ${+dd}, ${y}`;
-    if (y && mm) return `${month[+mm-1]} ${y}`;
+    if (y && mm && dd) return `${monthNames[+mm-1]} ${+dd}, ${y}`;
+    if (y && mm) return `${monthNames[+mm-1]} ${y}`;
     return y || null;
   };
 
+  // 3) Block heavy assets for speed
   await page.route('**/*', (route) => {
     const url = route.request().url();
     if (/\.(css|jpg|jpeg|png|svg|gif|woff2?)($|\?)/i.test(url)) route.abort();
@@ -49,31 +62,45 @@ async function runScrape(isbn) {
   });
 
   try {
-    await page.goto(`https://www.goodreads.com/search?q=${encodeURIComponent(isbn)}`, { timeout: 15000, waitUntil: 'domcontentloaded' });
-    try { await page.locator('[class*="Overlay__close"], button[aria-label="Close"]').first().click({ timeout: 3500 }); } catch {}
+    // 4) Go to Goodreads search
+    await page.goto(`https://www.goodreads.com/search?q=${encodeURIComponent(isbn)}`, {
+      timeout: 30000,
+      waitUntil: 'domcontentloaded',
+    });
 
+    // close any overlay if present
+    try {
+      await page.locator('[class*="Overlay__close"], button[aria-label="Close"]').first().click({ timeout: 3500 });
+    } catch {}
+
+    // 5) If on search results, click the first book
     if (!page.url().includes('/book/show/')) {
       const first = page.locator('a[href*="/book/show/"]:not([href*="/reviews"])').first();
-      await first.waitFor({ state: 'visible', timeout: 7000 });
+      await first.waitFor({ state: 'visible', timeout: 10000 });
       await first.click();
-      await page.waitForLoadState('domcontentloaded', { timeout: 9000 });
+      await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
     }
 
-    // open details in background
+    // 6) Try to open the details drawer (background)
     const openDetails = (async () => {
-      const vis = await page.locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]').first().isVisible().catch(() => false);
-      if (vis) return true;
-      const labels = [/book details & editions/i,/book details and editions/i,/book details/i,/details/i,/editions/i];
+      const visible = await page
+        .locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]')
+        .first()
+        .isVisible()
+        .catch(() => false);
+      if (visible) return true;
+
+      const labels = [/book details & editions/i, /book details and editions/i, /book details/i, /details/i, /editions/i];
       for (const rx of labels) {
         const btn = page.locator('button', { hasText: rx }).first();
         try {
-          await btn.waitFor({ state: 'visible', timeout: 700 });
-          await btn.click({ timeout: 500 });
-          await page.waitForTimeout(300);
+          await btn.waitFor({ state: 'visible', timeout: 1000 });
+          await btn.click({ timeout: 800 });
+          await page.waitForTimeout(400);
           const opened = await Promise.race([
-            page.waitForSelector('[data-testid="bookDetails"]', { timeout: 600 }).then(() => true).catch(() => false),
-            page.waitForSelector('dt:has-text("Published") + dd', { timeout: 600 }).then(() => true).catch(() => false),
-            page.waitForSelector('dt:has-text("Original title") + dd', { timeout: 600 }).then(() => true).catch(() => false),
+            page.waitForSelector('[data-testid="bookDetails"]', { timeout: 800 }).then(() => true).catch(() => false),
+            page.waitForSelector('dt:has-text("Published") + dd', { timeout: 800 }).then(() => true).catch(() => false),
+            page.waitForSelector('dt:has-text("Original title") + dd', { timeout: 800 }).then(() => true).catch(() => false),
           ]);
           if (opened) return true;
         } catch {}
@@ -81,35 +108,38 @@ async function runScrape(isbn) {
       return false;
     })();
 
+    // 7) Collect core fields (fast)
     const [
       title, author, ratingValue, ratingsCountText, descriptionRaw, genres,
       formatText, language, seriesText, ogCover, ldjsonScripts,
       sub1, sub2, sub3, sub4
     ] = await Promise.all([
-      page.locator('h1[data-testid="bookTitle"]').textContent({ timeout: 900 }).catch(() => null),
-      page.locator('.ContributorLink__name').first().textContent({ timeout: 900 }).catch(() => null),
-      page.locator('.RatingStatistics__rating').first().textContent({ timeout: 800 }).catch(() => null),
-      page.locator('[data-testid="ratingsCount"]').first().textContent({ timeout: 800 }).catch(() => null),
-      page.locator('[data-testid="description"] [data-testid="contentContainer"]').first().textContent({ timeout: 900 }).catch(() => null),
+      page.locator('h1[data-testid="bookTitle"]').textContent({ timeout: 1500 }).catch(() => null),
+      page.locator('.ContributorLink__name').first().textContent({ timeout: 1500 }).catch(() => null),
+      page.locator('.RatingStatistics__rating').first().textContent({ timeout: 1200 }).catch(() => null),
+      page.locator('[data-testid="ratingsCount"]').first().textContent({ timeout: 1200 }).catch(() => null),
+      page.locator('[data-testid="description"] [data-testid="contentContainer"]').first().textContent({ timeout: 1500 }).catch(() => null),
       page.locator('[data-testid="genresList"] .Button__labelItem').allTextContents().catch(() => []),
-      page.locator('dt:has-text("Format") + dd').textContent({ timeout: 700 }).catch(() => null),
-      page.locator('dt:has-text("Language") + dd').textContent({ timeout: 700 }).catch(() => null),
-      page.locator('dt:has-text("Series") + dd a').textContent({ timeout: 700 }).catch(() => null),
+      page.locator('dt:has-text("Format") + dd').textContent({ timeout: 1200 }).catch(() => null),
+      page.locator('dt:has-text("Language") + dd').textContent({ timeout: 1200 }).catch(() => null),
+      page.locator('dt:has-text("Series") + dd a').textContent({ timeout: 1200 }).catch(() => null),
       page.locator('meta[property="og:image"]').getAttribute('content').catch(() => null),
       page.locator('script[type="application/ld+json"]').allTextContents().catch(() => []),
-      page.locator('[data-testid="bookSubtitle"]').textContent({ timeout: 600 }).catch(() => null),
-      page.locator('.BookPageTitleSection__subtitle').textContent({ timeout: 600 }).catch(() => null),
-      page.locator('.BookPageTitleSection__title h3').first().textContent({ timeout: 600 }).catch(() => null),
-      page.locator('[data-testid="bookPageTitleSection"] h3').first().textContent({ timeout: 600 }).catch(() => null),
+      page.locator('[data-testid="bookSubtitle"]').textContent({ timeout: 800 }).catch(() => null),
+      page.locator('.BookPageTitleSection__subtitle').textContent({ timeout: 800 }).catch(() => null),
+      page.locator('.BookPageTitleSection__title h3').first().textContent({ timeout: 800 }).catch(() => null),
+      page.locator('[data-testid="bookPageTitleSection"] h3').first().textContent({ timeout: 800 }).catch(() => null),
     ]);
 
-    let subtitle = (s => s && s.trim())(sub1) || (s => s && s.trim())(sub2) || (s => s && s.trim())(sub3) || (s => s && s.trim())(sub4);
+    // subtitle
+    let subtitle = clean(sub1) || clean(sub2) || clean(sub3) || clean(sub4);
 
-    // JSON-LD → publishedfull
+    // 8) JSON-LD fallback for publishedfull
     let publishedfull = null;
     try {
       const blobs = (ldjsonScripts || []).map(t => { try { return JSON.parse(t); } catch { return null; } }).filter(Boolean);
-      const flat = []; const flatten = (o) => { if (Array.isArray(o)) return o.forEach(flatten); if (o && typeof o === 'object') { flat.push(o); for (const v of Object.values(o)) flatten(v); } };
+      const flat = [];
+      const flatten = (o) => { if (Array.isArray(o)) return o.forEach(flatten); if (o && typeof o === 'object') { flat.push(o); for (const v of Object.values(o)) flatten(v); } };
       blobs.forEach(flatten);
       const isBookType = (t) => typeof t === 'string' && /\bBook\b/i.test(t);
       const bookObj = flat.find(o => o && (isBookType(o['@type']) || (Array.isArray(o['@type']) && o['@type'].some(isBookType))));
@@ -128,11 +158,12 @@ async function runScrape(isbn) {
       }
     } catch {}
 
+    // 9) Wait up to 1s for details drawer (then read dt/dd)
     await Promise.race([openDetails, new Promise(r => setTimeout(r, 1000))]);
 
     const [originaltitleRaw, publishedCandidates] = await Promise.all([
-      page.locator('dt:has-text("Original title") + dd [data-testid="contentContainer"]').textContent({ timeout: 800 })
-        .catch(() => page.locator('dt:has-text("Original title") + dd').textContent({ timeout: 700 }).catch(() => null)),
+      page.locator('dt:has-text("Original title") + dd [data-testid="contentContainer"]').textContent({ timeout: 1000 })
+        .catch(() => page.locator('dt:has-text("Original title") + dd').textContent({ timeout: 900 }).catch(() => null)),
       publishedfull ? Promise.resolve([]) : page.locator('dt:has-text("Published") + dd').allTextContents().catch(() => []),
     ]);
 
@@ -153,6 +184,7 @@ async function runScrape(isbn) {
       } catch {}
     }
 
+    // 10) Assemble result
     const details = {
       isbn,
       title: clean(title),
