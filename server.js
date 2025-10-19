@@ -3,28 +3,27 @@ import { chromium } from 'playwright';
 
 const app = express();
 
-// Health
-app.get('/', (req, res) => res.send('OK - scraper server running'));
+// health check
+app.get('/', (_req, res) => res.send('OK - scraper server running'));
 
-// Simple ISBN endpoint: /scrape?isbn=9781847399960
+// GET /scrape?isbn=9781847399960
 app.get('/scrape', async (req, res) => {
   const isbn = String(req.query.isbn || '').trim();
   if (!isbn) return res.status(400).json({ error: 'Missing ?isbn=' });
 
   try {
-    const result = await runScrape(isbn);
-    if (!result) return res.status(404).json({ error: 'No data' });
-    res.json(result);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: String(err.message || err) });
+    const data = await runScrape(isbn);
+    res.json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`server listening on port ${PORT}`));
 
-// -------- Playwright scrape (speed-optimized; keeps genres, subtitle, originaltitle, publishedfull) --------
+// ------------ scraper ------------
 async function runScrape(isbn) {
   const browser = await chromium.launch({
     headless: true,
@@ -34,16 +33,15 @@ async function runScrape(isbn) {
   const page = await context.newPage();
 
   const clean = (s) => (s ? String(s).replace(/\s+/g, ' ').trim() : null);
-  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const month = ['January','February','March','April','May','June','July','August','September','October','November','December'];
   const fmtISO = (iso) => {
     const m = String(iso||'').match(/^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$/);
     if (!m) return null; const [,y,mm,dd]=m;
-    if (y && mm && dd) return `${monthNames[+mm-1]} ${+dd}, ${y}`;
-    if (y && mm) return `${monthNames[+mm-1]} ${y}`;
+    if (y && mm && dd) return `${month[+mm-1]} ${+dd}, ${y}`;
+    if (y && mm) return `${month[+mm-1]} ${y}`;
     return y || null;
   };
 
-  // Block heavy assets
   await page.route('**/*', (route) => {
     const url = route.request().url();
     if (/\.(css|jpg|jpeg|png|svg|gif|woff2?)($|\?)/i.test(url)) route.abort();
@@ -61,9 +59,10 @@ async function runScrape(isbn) {
       await page.waitForLoadState('domcontentloaded', { timeout: 9000 });
     }
 
+    // open details in background
     const openDetails = (async () => {
-      const visible = await page.locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]').first().isVisible().catch(() => false);
-      if (visible) return true;
+      const vis = await page.locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]').first().isVisible().catch(() => false);
+      if (vis) return true;
       const labels = [/book details & editions/i,/book details and editions/i,/book details/i,/details/i,/editions/i];
       for (const rx of labels) {
         const btn = page.locator('button', { hasText: rx }).first();
@@ -104,7 +103,7 @@ async function runScrape(isbn) {
       page.locator('[data-testid="bookPageTitleSection"] h3').first().textContent({ timeout: 600 }).catch(() => null),
     ]);
 
-    let subtitle = clean(sub1) || clean(sub2) || clean(sub3) || clean(sub4);
+    let subtitle = (s => s && s.trim())(sub1) || (s => s && s.trim())(sub2) || (s => s && s.trim())(sub3) || (s => s && s.trim())(sub4);
 
     // JSON-LD → publishedfull
     let publishedfull = null;
@@ -180,4 +179,3 @@ async function runScrape(isbn) {
     throw err;
   }
 }
-add scraper endpoint
