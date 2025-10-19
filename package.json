@@ -2,11 +2,13 @@
   "name": "scraper-worker",
   "private": true,
   "type": "module",
-  "engines": { "node": "20" },
+  "engines": { "node": "22.x" },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "playwright": "^1.48.2"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "playwright install --with-deps chromium"
   }
 }
