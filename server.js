@@ -116,8 +116,7 @@ async function runScrape(isbn) {
         await page.waitForLoadState('domcontentloaded');
       }
 
-      // --- Wait for React hydration of the title section (critical!) ---
-      // Either the test-id title appears, or the legacy title wrapper.
+      // Wait for React hydration of the title section
       await page.waitForSelector('h1[data-testid="bookTitle"], .BookPageTitleSection__title', { timeout: 8000 });
 
       // Expand description if there is a “...more” button
@@ -126,7 +125,7 @@ async function runScrape(isbn) {
       // Try opening details drawer (best-effort)
       const openDetails = (async () => {
         const visible = await page
-          .locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]')
+          .locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, dt:has-text("Format") + dd, [data-testid="bookDetails"]')
           .first().isVisible().catch(() => false);
         if (visible) return true;
         const labels = [/book details & editions/i,/book details and editions/i,/book details/i,/details/i,/editions/i];
@@ -140,6 +139,7 @@ async function runScrape(isbn) {
               page.waitForSelector('[data-testid="bookDetails"]', { timeout: 900 }).then(() => true).catch(() => false),
               page.waitForSelector('dt:has-text("Published") + dd', { timeout: 900 }).then(() => true).catch(() => false),
               page.waitForSelector('dt:has-text("Original title") + dd', { timeout: 900 }).then(() => true).catch(() => false),
+              page.waitForSelector('dt:has-text("Format") + dd', { timeout: 900 }).then(() => true).catch(() => false),
             ]);
             if (opened) return true;
           } catch {}
@@ -147,7 +147,7 @@ async function runScrape(isbn) {
         return false;
       })();
 
-      // ----- Extract core fields (allow more time for these) -----
+      // Helper for text with explicit timeout
       const getText = async (locator, ms=5000) =>
         await locator.first().textContent({ timeout: ms }).then(clean).catch(() => null);
 
@@ -162,7 +162,7 @@ async function runScrape(isbn) {
         getText(page.locator('[data-testid="ratingsCount"]'), 5000),
         getText(page.locator('[data-testid="description"] [data-testid="contentContainer"]'), 6000),
         page.locator('[data-testid="genresList"] .Button__labelItem').allTextContents().catch(() => []),
-        getText(page.locator('dt:has-text("Format") + dd'), 5000),
+        getText(page.locator('dt:has-text("Format") + dd'), 5500),                   // <-- format cell
         getText(page.locator('dt:has-text("Language") + dd'), 5000),
         getText(page.locator('dt:has-text("Series") + dd a'), 5000),
         page.locator('meta[property="og:image"]').getAttribute('content').catch(() => null),
@@ -174,6 +174,23 @@ async function runScrape(isbn) {
       ]);
 
       let subtitle = sub1 || sub2 || sub3 || sub4 || null;
+
+      // Parse format/pageCount from the Format cell
+      let pageCount = null;
+      let format = null;
+      if (formatText) {
+        const parts = formatText.split(/,|\//).map(p => p.trim()).filter(Boolean);
+        for (const part of parts) {
+          if (/pages?/i.test(part)) {
+            const n = parseInt(part.replace(/\D/g, ''), 10);
+            if (!Number.isNaN(n)) pageCount = n;
+          } else if (!format) {
+            // Ignore fragments that clearly aren't the binding type
+            const cleaned = part.replace(/\s*\(\d+(st|nd|rd|th)\s*edition\)/i, '').trim();
+            if (!/^\d/.test(cleaned)) format = cleaned; // skip pieces that start with numbers (often page counts)
+          }
+        }
+      }
 
       // JSON-LD → publishedfull
       let publishedfull = null;
@@ -249,6 +266,9 @@ async function runScrape(isbn) {
         })(),
         language: language || null,
         series: seriesText ? seriesText.replace(/\s*\(#\d+\.?\d*\)$/, '').trim() : undefined,
+        // NEW:
+        format: format || null,
+        pageCount: pageCount ?? undefined,
         publishedfull: publishedfull || null,
       };
 
