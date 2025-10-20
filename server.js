@@ -1,53 +1,45 @@
 import express from 'express';
+import { setTimeout as delay } from 'timers/promises';
 
-// Make Playwright use the browsers baked into the Docker image
 process.env.PLAYWRIGHT_BROWSERS_PATH = '/ms-playwright';
 process.env.PLAYWRIGHT_SKIP_DOWNLOAD = '1';
 
-import { setTimeout as delay } from 'timers/promises';
+const app = express();
 
-let browserRef = null;        // holds the launched browser instance
-let launching = null;         // Promise while launching to dedupe concurrent starts
+function withDeadline(promise, ms, label = 'operation') {
+  return Promise.race([
+    promise,
+    (async () => { await delay(ms); throw new Error(`${label} timed out after ${ms}ms`); })(),
+  ]);
+}
+const clean = (s) => (s ? String(s).replace(/\s+/g, ' ').trim() : null);
 
-async function launchBrowser() {
+let browserRef = null, launching = null;
+
+async function launchBrowserOnce() {
   const { chromium } = await import('playwright');
   const browser = await chromium.launch({
     headless: true,
-    // Keep flags minimal & stable for 1.56.x on Render
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-extensions',
-      '--no-zygote',
-    ],
+    args: ['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-extensions','--no-zygote'],
   });
-  // If the browser disconnects (e.g., OOM or Render sleep), allow relaunch
   browser.on('disconnected', () => { browserRef = null; });
   return browser;
 }
-
-// Ensure we have a live browser; relaunch if it died.
-async function getBrowser() {
+async function getBrowser({ timeoutMs = 20000 } = {}) {
   if (browserRef) return browserRef;
-  if (launching) return launching;
-
-  launching = launchBrowser()
-    .then((b) => { browserRef = b; return b; })
-    .finally(() => { launching = null; });
-
-  return launching;
+  if (!launching) {
+    launching = (async () => { try { return await launchBrowserOnce(); } finally { launching = null; } })()
+      .then(b => (browserRef = b), e => { browserRef = null; throw e; });
+  }
+  return withDeadline(launching, timeoutMs, 'Chromium launch');
 }
-
-// Try to create a new context; if it fails because browser is gone, relaunch once.
 async function newContextSafe() {
   try {
     const browser = await getBrowser();
     return await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
     });
-  } catch (e) {
-    // Hard reset and retry once
+  } catch {
     try { if (browserRef) await browserRef.close(); } catch {}
     browserRef = null;
     const browser = await getBrowser();
@@ -57,31 +49,28 @@ async function newContextSafe() {
   }
 }
 
-const app = express();
-
-// Health
 app.get('/', (_req, res) => res.send('OK - scraper server running'));
-
-// Warmup (launches Chromium once)
 app.get('/warmup', async (_req, res) => {
   try {
-    const ctx = await newContextSafe();
-    const page = await ctx.newPage();
-    await page.goto('https://www.goodreads.com/', { timeout: 20000, waitUntil: 'domcontentloaded' });
-    await ctx.close();
+    await withDeadline((async () => {
+      const ctx = await newContextSafe();
+      const page = await ctx.newPage();
+      page.setDefaultNavigationTimeout(15000);
+      page.setDefaultTimeout(5000);
+      await page.goto('https://www.goodreads.com/', { waitUntil: 'domcontentloaded' });
+      await ctx.close();
+    })(), 20000, 'warmup');
     res.send('warmed');
   } catch (e) {
     res.status(500).send(String(e?.message || e));
   }
 });
 
-// Main: /scrape?isbn=9781847399960
 app.get('/scrape', async (req, res) => {
   const isbn = String(req.query.isbn || '').trim();
   if (!isbn) return res.status(400).json({ error: 'Missing ?isbn=' });
-
   try {
-    const data = await runScrape(isbn);
+    const data = await withDeadline(runScrape(isbn), 30000, 'scrape');
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
@@ -92,69 +81,65 @@ const PORT = process.env.PORT || 10000;
 const HOST = '0.0.0.0';
 app.listen(PORT, HOST, async () => {
   console.log(`server listening on http://${HOST}:${PORT}`);
-  // background warm launch
-  try { await getBrowser(); console.log('Chromium launched (warm).'); } catch (e) { console.log('Warmup launch failed:', e?.message || e); }
+  try { await withDeadline(getBrowser(), 20000, 'initial launch'); console.log('Chromium launched (warm)'); } catch (e) { console.log('Warm launch failed:', e?.message || e); }
 });
 
-// ---------- scraper ----------
+// ---------------- SCRAPER ----------------
 async function runScrape(isbn) {
-  // one retry end-to-end if something transient happens
   for (let attempt = 1; attempt <= 2; attempt++) {
     let ctx;
     try {
       ctx = await newContextSafe();
       const page = await ctx.newPage();
 
-      // speed up: block heavy assets
+      // Tight defaults but we explicitly wait longer for key selectors
+      page.setDefaultNavigationTimeout(18000);
+      page.setDefaultTimeout(4000);
+
+      // Block heavy assets (keep HTML/JS)
       await page.route('**/*', (route) => {
         const url = route.request().url();
         if (/\.(css|jpg|jpeg|png|svg|gif|woff2?)($|\?)/i.test(url)) route.abort();
         else route.continue();
       });
 
-      const clean = (s) => (s ? String(s).replace(/\s+/g, ' ').trim() : null);
-      const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-      const fmtISO = (iso) => {
-        const m = String(iso||'').match(/^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$/);
-        if (!m) return null; const [,y,mm,dd]=m;
-        if (y && mm && dd) return `${monthNames[+mm-1]} ${+dd}, ${y}`;
-        if (y && mm) return `${monthNames[+mm-1]} ${y}`;
-        return y || null;
-      };
+      await page.goto(`https://www.goodreads.com/search?q=${encodeURIComponent(isbn)}`, { waitUntil: 'domcontentloaded' });
 
-      await page.goto(`https://www.goodreads.com/search?q=${encodeURIComponent(isbn)}`, {
-        timeout: 30000, waitUntil: 'domcontentloaded',
-      });
+      // Close overlay if present
+      try { await page.locator('[class*="Overlay__close"], button[aria-label="Close"]').first().click({ timeout: 2500 }); } catch {}
 
-      // close overlay if present
-      try { await page.locator('[class*="Overlay__close"], button[aria-label="Close"]').first().click({ timeout: 3000 }); } catch {}
-
-      // jump into first result if still on search page
+      // Go to first result if still on search page
       if (!page.url().includes('/book/show/')) {
         const first = page.locator('a[href*="/book/show/"]:not([href*="/reviews"])').first();
         await first.waitFor({ state: 'visible', timeout: 10000 });
         await first.click();
-        await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+        await page.waitForLoadState('domcontentloaded');
       }
 
-      // try to open details drawer (non-blocking)
+      // --- Wait for React hydration of the title section (critical!) ---
+      // Either the test-id title appears, or the legacy title wrapper.
+      await page.waitForSelector('h1[data-testid="bookTitle"], .BookPageTitleSection__title', { timeout: 8000 });
+
+      // Expand description if there is a “...more” button
+      try { await page.locator('.BookPageMetadataSection__description .Button--text').click({ timeout: 2000 }); } catch {}
+
+      // Try opening details drawer (best-effort)
       const openDetails = (async () => {
         const visible = await page
           .locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]')
           .first().isVisible().catch(() => false);
         if (visible) return true;
-
         const labels = [/book details & editions/i,/book details and editions/i,/book details/i,/details/i,/editions/i];
         for (const rx of labels) {
           const btn = page.locator('button', { hasText: rx }).first();
           try {
             await btn.waitFor({ state: 'visible', timeout: 1000 });
             await btn.click({ timeout: 800 });
-            await page.waitForTimeout(400);
+            await page.waitForTimeout(350);
             const opened = await Promise.race([
-              page.waitForSelector('[data-testid="bookDetails"]', { timeout: 800 }).then(() => true).catch(() => false),
-              page.waitForSelector('dt:has-text("Published") + dd', { timeout: 800 }).then(() => true).catch(() => false),
-              page.waitForSelector('dt:has-text("Original title") + dd', { timeout: 800 }).then(() => true).catch(() => false),
+              page.waitForSelector('[data-testid="bookDetails"]', { timeout: 900 }).then(() => true).catch(() => false),
+              page.waitForSelector('dt:has-text("Published") + dd', { timeout: 900 }).then(() => true).catch(() => false),
+              page.waitForSelector('dt:has-text("Original title") + dd', { timeout: 900 }).then(() => true).catch(() => false),
             ]);
             if (opened) return true;
           } catch {}
@@ -162,39 +147,52 @@ async function runScrape(isbn) {
         return false;
       })();
 
+      // ----- Extract core fields (allow more time for these) -----
+      const getText = async (locator, ms=5000) =>
+        await locator.first().textContent({ timeout: ms }).then(clean).catch(() => null);
+
       const [
         title, author, ratingValue, ratingsCountText, descriptionRaw, genres,
         formatText, language, seriesText, ogCover, ldjsonScripts,
         sub1, sub2, sub3, sub4
       ] = await Promise.all([
-        page.locator('h1[data-testid="bookTitle"]').textContent({ timeout: 1500 }).catch(() => null),
-        page.locator('.ContributorLink__name').first().textContent({ timeout: 1500 }).catch(() => null),
-        page.locator('.RatingStatistics__rating').first().textContent({ timeout: 1200 }).catch(() => null),
-        page.locator('[data-testid="ratingsCount"]').first().textContent({ timeout: 1200 }).catch(() => null),
-        page.locator('[data-testid="description"] [data-testid="contentContainer"]').first().textContent({ timeout: 1500 }).catch(() => null),
+        getText(page.locator('h1[data-testid="bookTitle"]'), 6000),
+        getText(page.locator('.ContributorLink__name'), 6000),
+        getText(page.locator('.RatingStatistics__rating'), 5000),
+        getText(page.locator('[data-testid="ratingsCount"]'), 5000),
+        getText(page.locator('[data-testid="description"] [data-testid="contentContainer"]'), 6000),
         page.locator('[data-testid="genresList"] .Button__labelItem').allTextContents().catch(() => []),
-        page.locator('dt:has-text("Format") + dd').textContent({ timeout: 1200 }).catch(() => null),
-        page.locator('dt:has-text("Language") + dd').textContent({ timeout: 1200 }).catch(() => null),
-        page.locator('dt:has-text("Series") + dd a').textContent({ timeout: 1200 }).catch(() => null),
+        getText(page.locator('dt:has-text("Format") + dd'), 5000),
+        getText(page.locator('dt:has-text("Language") + dd'), 5000),
+        getText(page.locator('dt:has-text("Series") + dd a'), 5000),
         page.locator('meta[property="og:image"]').getAttribute('content').catch(() => null),
         page.locator('script[type="application/ld+json"]').allTextContents().catch(() => []),
-        page.locator('[data-testid="bookSubtitle"]').textContent({ timeout: 800 }).catch(() => null),
-        page.locator('.BookPageTitleSection__subtitle').textContent({ timeout: 800 }).catch(() => null),
-        page.locator('.BookPageTitleSection__title h3').first().textContent({ timeout: 800 }).catch(() => null),
-        page.locator('[data-testid="bookPageTitleSection"] h3').first().textContent({ timeout: 800 }).catch(() => null),
+        getText(page.locator('[data-testid="bookSubtitle"]'), 3500),
+        getText(page.locator('.BookPageTitleSection__subtitle'), 3500),
+        getText(page.locator('.BookPageTitleSection__title h3').first(), 3500),
+        getText(page.locator('[data-testid="bookPageTitleSection"] h3').first(), 3500),
       ]);
 
-      let subtitle = clean(sub1) || clean(sub2) || clean(sub3) || clean(sub4);
+      let subtitle = sub1 || sub2 || sub3 || sub4 || null;
 
       // JSON-LD → publishedfull
       let publishedfull = null;
       try {
         const blobs = (ldjsonScripts || []).map(t => { try { return JSON.parse(t); } catch { return null; } }).filter(Boolean);
-        const flat = []; const flatten = (o) => { if (Array.isArray(o)) return o.forEach(flatten); if (o && typeof o === 'object') { flat.push(o); for (const v of Object.values(o)) flatten(v); } };
+        const flat = [];
+        const flatten = (o) => { if (Array.isArray(o)) return o.forEach(flatten); if (o && typeof o === 'object') { flat.push(o); for (const v of Object.values(o)) flatten(v); } };
         blobs.forEach(flatten);
         const isBookType = (t) => typeof t === 'string' && /\bBook\b/i.test(t);
         const bookObj = flat.find(o => o && (isBookType(o['@type']) || (Array.isArray(o['@type']) && o['@type'].some(isBookType))));
         if (bookObj) {
+          const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+          const fmtISO = (iso) => {
+            const m = String(iso||'').match(/^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$/);
+            if (!m) return null; const [,y,mm,dd]=m;
+            if (y && mm && dd) return `${monthNames[+mm-1]} ${+dd}, ${y}`;
+            if (y && mm) return `${monthNames[+mm-1]} ${y}`;
+            return y || null;
+          };
           const dateText = fmtISO(clean(bookObj.datePublished));
           let publisherName = null;
           const pub = bookObj.publisher;
@@ -209,11 +207,12 @@ async function runScrape(isbn) {
         }
       } catch {}
 
-      await Promise.race([openDetails, delay(1000)]);
+      // Ensure details had a chance to open
+      await Promise.race([openDetails, delay(700)]);
 
       const [originaltitleRaw, publishedCandidates] = await Promise.all([
-        page.locator('dt:has-text("Original title") + dd [data-testid="contentContainer"]').textContent({ timeout: 1000 })
-          .catch(() => page.locator('dt:has-text("Original title") + dd').textContent({ timeout: 900 }).catch(() => null)),
+        getText(page.locator('dt:has-text("Original title") + dd [data-testid="contentContainer"]'), 4000)
+          .then(v => v ?? getText(page.locator('dt:has-text("Original title") + dd'), 3500)),
         publishedfull ? Promise.resolve([]) : page.locator('dt:has-text("Published") + dd').allTextContents().catch(() => []),
       ]);
 
@@ -236,21 +235,21 @@ async function runScrape(isbn) {
 
       const details = {
         isbn,
-        title: clean(title),
-        subtitle: subtitle || null,
-        originaltitle: clean(originaltitleRaw) || null,
-        author: clean(author),
+        title: title || null,
+        subtitle,
+        originaltitle: originaltitleRaw || null,
+        author: author || null,
         cover: clean(ogCover) || null,
         avgRating: (() => { const n = parseFloat(ratingValue); return Number.isNaN(n) ? undefined : n; })(),
         ratingCount: (() => { const rc = parseInt((ratingsCountText||'').replace(/\D/g,''), 10); return Number.isNaN(rc) ? undefined : rc; })(),
-        description: clean(descriptionRaw)?.replace(/\s*\.{3}\s*more\s*$/i, '').trim() || null,
+        description: descriptionRaw?.replace(/\s*\.{3}\s*more\s*$/i, '').trim() || null,
         category: (() => {
           const cleanedGenres = (genres||[]).map(g => clean(g)).filter(Boolean).filter(g => !/^\.\.\.more$/i.test(g));
           return cleanedGenres.length ? cleanedGenres.join(', ') : undefined;
         })(),
-        language: clean(language),
+        language: language || null,
         series: seriesText ? seriesText.replace(/\s*\(#\d+\.?\d*\)$/, '').trim() : undefined,
-        publishedfull: clean(publishedfull),
+        publishedfull: publishedfull || null,
       };
 
       await ctx.close();
@@ -258,7 +257,7 @@ async function runScrape(isbn) {
     } catch (err) {
       try { if (ctx) await ctx.close(); } catch {}
       if (attempt === 2) throw err;
-      // small backoff & hard reset browser for the second try
+      // Reset and retry once
       try { if (browserRef) await browserRef.close(); } catch {}
       browserRef = null;
       await delay(400);
