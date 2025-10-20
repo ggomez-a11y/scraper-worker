@@ -1,26 +1,60 @@
 import express from 'express';
 
-// Use the browsers already baked into the Playwright Docker image
+// Make Playwright use the browsers baked into the Docker image
 process.env.PLAYWRIGHT_BROWSERS_PATH = '/ms-playwright';
 process.env.PLAYWRIGHT_SKIP_DOWNLOAD = '1';
 
-let browserPromise = null; // singleton Chromium
-let launching = false;
+import { setTimeout as delay } from 'timers/promises';
 
-async function getBrowser() {
-  if (browserPromise) return browserPromise;
-  if (launching) { await new Promise(r => setTimeout(r, 300)); return getBrowser(); }
-  launching = true;
+let browserRef = null;        // holds the launched browser instance
+let launching = null;         // Promise while launching to dedupe concurrent starts
+
+async function launchBrowser() {
   const { chromium } = await import('playwright');
-  browserPromise = chromium.launch({
+  const browser = await chromium.launch({
     headless: true,
+    // Keep flags minimal & stable for 1.56.x on Render
     args: [
-      '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-      '--disable-gpu','--disable-extensions','--single-process','--no-zygote',
-      '--disable-features=IsolateOrigins,site-per-process','--js-flags=--max-old-space-size=128',
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--no-zygote',
     ],
-  }).finally(() => { launching = false; });
-  return browserPromise;
+  });
+  // If the browser disconnects (e.g., OOM or Render sleep), allow relaunch
+  browser.on('disconnected', () => { browserRef = null; });
+  return browser;
+}
+
+// Ensure we have a live browser; relaunch if it died.
+async function getBrowser() {
+  if (browserRef) return browserRef;
+  if (launching) return launching;
+
+  launching = launchBrowser()
+    .then((b) => { browserRef = b; return b; })
+    .finally(() => { launching = null; });
+
+  return launching;
+}
+
+// Try to create a new context; if it fails because browser is gone, relaunch once.
+async function newContextSafe() {
+  try {
+    const browser = await getBrowser();
+    return await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+    });
+  } catch (e) {
+    // Hard reset and retry once
+    try { if (browserRef) await browserRef.close(); } catch {}
+    browserRef = null;
+    const browser = await getBrowser();
+    return await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+    });
+  }
 }
 
 const app = express();
@@ -31,10 +65,7 @@ app.get('/', (_req, res) => res.send('OK - scraper server running'));
 // Warmup (launches Chromium once)
 app.get('/warmup', async (_req, res) => {
   try {
-    const browser = await getBrowser();
-    const ctx = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
-    });
+    const ctx = await newContextSafe();
     const page = await ctx.newPage();
     await page.goto('https://www.goodreads.com/', { timeout: 20000, waitUntil: 'domcontentloaded' });
     await ctx.close();
@@ -61,42 +92,44 @@ const PORT = process.env.PORT || 10000;
 const HOST = '0.0.0.0';
 app.listen(PORT, HOST, async () => {
   console.log(`server listening on http://${HOST}:${PORT}`);
-  try { await getBrowser(); console.log('Chromium launched (warm).'); }
-  catch (e) { console.log('Warmup launch failed (will try on first request):', e?.message || e); }
+  // background warm launch
+  try { await getBrowser(); console.log('Chromium launched (warm).'); } catch (e) { console.log('Warmup launch failed:', e?.message || e); }
 });
 
 // ---------- scraper ----------
 async function runScrape(isbn) {
-  const browser = await getBrowser();
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
-  });
-  const page = await context.newPage();
-
-  const clean = (s) => (s ? String(s).replace(/\s+/g, ' ').trim() : null);
-  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-  const fmtISO = (iso) => {
-    const m = String(iso||'').match(/^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$/);
-    if (!m) return null; const [,y,mm,dd]=m;
-    if (y && mm && dd) return `${monthNames[+mm-1]} ${+dd}, ${y}`;
-    if (y && mm) return `${monthNames[+mm-1]} ${y}`;
-    return y || null;
-  };
-
-  await page.route('**/*', (route) => {
-    const url = route.request().url();
-    if (/\.(css|jpg|jpeg|png|svg|gif|woff2?)($|\?)/i.test(url)) route.abort();
-    else route.continue();
-  });
-
+  // one retry end-to-end if something transient happens
   for (let attempt = 1; attempt <= 2; attempt++) {
+    let ctx;
     try {
+      ctx = await newContextSafe();
+      const page = await ctx.newPage();
+
+      // speed up: block heavy assets
+      await page.route('**/*', (route) => {
+        const url = route.request().url();
+        if (/\.(css|jpg|jpeg|png|svg|gif|woff2?)($|\?)/i.test(url)) route.abort();
+        else route.continue();
+      });
+
+      const clean = (s) => (s ? String(s).replace(/\s+/g, ' ').trim() : null);
+      const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+      const fmtISO = (iso) => {
+        const m = String(iso||'').match(/^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$/);
+        if (!m) return null; const [,y,mm,dd]=m;
+        if (y && mm && dd) return `${monthNames[+mm-1]} ${+dd}, ${y}`;
+        if (y && mm) return `${monthNames[+mm-1]} ${y}`;
+        return y || null;
+      };
+
       await page.goto(`https://www.goodreads.com/search?q=${encodeURIComponent(isbn)}`, {
         timeout: 30000, waitUntil: 'domcontentloaded',
       });
 
+      // close overlay if present
       try { await page.locator('[class*="Overlay__close"], button[aria-label="Close"]').first().click({ timeout: 3000 }); } catch {}
 
+      // jump into first result if still on search page
       if (!page.url().includes('/book/show/')) {
         const first = page.locator('a[href*="/book/show/"]:not([href*="/reviews"])').first();
         await first.waitFor({ state: 'visible', timeout: 10000 });
@@ -104,11 +137,13 @@ async function runScrape(isbn) {
         await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
       }
 
+      // try to open details drawer (non-blocking)
       const openDetails = (async () => {
         const visible = await page
           .locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]')
           .first().isVisible().catch(() => false);
         if (visible) return true;
+
         const labels = [/book details & editions/i,/book details and editions/i,/book details/i,/details/i,/editions/i];
         for (const rx of labels) {
           const btn = page.locator('button', { hasText: rx }).first();
@@ -174,7 +209,7 @@ async function runScrape(isbn) {
         }
       } catch {}
 
-      await Promise.race([openDetails, new Promise(r => setTimeout(r, 1000))]);
+      await Promise.race([openDetails, delay(1000)]);
 
       const [originaltitleRaw, publishedCandidates] = await Promise.all([
         page.locator('dt:has-text("Original title") + dd [data-testid="contentContainer"]').textContent({ timeout: 1000 })
@@ -218,11 +253,15 @@ async function runScrape(isbn) {
         publishedfull: clean(publishedfull),
       };
 
-      await context.close();
+      await ctx.close();
       return details;
     } catch (err) {
-      if (attempt === 2) { try { await context.close(); } catch {} throw err; }
-      await new Promise(r => setTimeout(r, 500));
+      try { if (ctx) await ctx.close(); } catch {}
+      if (attempt === 2) throw err;
+      // small backoff & hard reset browser for the second try
+      try { if (browserRef) await browserRef.close(); } catch {}
+      browserRef = null;
+      await delay(400);
     }
   }
 }
