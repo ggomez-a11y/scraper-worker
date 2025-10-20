@@ -1,19 +1,18 @@
-FROM mcr.microsoft.com/playwright:v1.48.2-jammy
+FROM mcr.microsoft.com/playwright:v1.56.1-jammy
+
+# Use the browsers already baked into this image
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PLAYWRIGHT_SKIP_DOWNLOAD=1
 
 WORKDIR /app
 
-# Install only prod deps
+# Install prod deps
 COPY package*.json ./
 RUN npm install --only=production
 
-# Ensure Chromium is installed in the path Playwright expects
-# This avoids the "Executable doesn't exist" error at runtime.
-RUN npx playwright install chromium
-
-# Copy app code
+# App code
 COPY . .
 
 # Render provides PORT
 ENV PORT=10000
-
 CMD ["npm","start"]
