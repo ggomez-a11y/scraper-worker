@@ -1,15 +1,50 @@
 import express from 'express';
 
-// IMPORTANT: tell Playwright to use the browsers baked into the Docker image
+// Use the browsers already baked into the Playwright Docker image
 process.env.PLAYWRIGHT_BROWSERS_PATH = '/ms-playwright';
 process.env.PLAYWRIGHT_SKIP_DOWNLOAD = '1';
+
+let browserPromise = null; // singleton Chromium
+let launching = false;
+
+async function getBrowser() {
+  if (browserPromise) return browserPromise;
+  if (launching) { await new Promise(r => setTimeout(r, 300)); return getBrowser(); }
+  launching = true;
+  const { chromium } = await import('playwright');
+  browserPromise = chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+      '--disable-gpu','--disable-extensions','--single-process','--no-zygote',
+      '--disable-features=IsolateOrigins,site-per-process','--js-flags=--max-old-space-size=128',
+    ],
+  }).finally(() => { launching = false; });
+  return browserPromise;
+}
 
 const app = express();
 
 // Health
 app.get('/', (_req, res) => res.send('OK - scraper server running'));
 
-// One simple endpoint: /scrape?isbn=9781847399960
+// Warmup (launches Chromium once)
+app.get('/warmup', async (_req, res) => {
+  try {
+    const browser = await getBrowser();
+    const ctx = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+    });
+    const page = await ctx.newPage();
+    await page.goto('https://www.goodreads.com/', { timeout: 20000, waitUntil: 'domcontentloaded' });
+    await ctx.close();
+    res.send('warmed');
+  } catch (e) {
+    res.status(500).send(String(e?.message || e));
+  }
+});
+
+// Main: /scrape?isbn=9781847399960
 app.get('/scrape', async (req, res) => {
   const isbn = String(req.query.isbn || '').trim();
   if (!isbn) return res.status(400).json({ error: 'Missing ?isbn=' });
@@ -24,27 +59,17 @@ app.get('/scrape', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 const HOST = '0.0.0.0';
-app.listen(PORT, HOST, () => console.log(`server listening on http://${HOST}:${PORT}`));
+app.listen(PORT, HOST, async () => {
+  console.log(`server listening on http://${HOST}:${PORT}`);
+  try { await getBrowser(); console.log('Chromium launched (warm).'); }
+  catch (e) { console.log('Warmup launch failed (will try on first request):', e?.message || e); }
+});
 
-// ---------------- SCRAPER (robust + fast) ----------------
+// ---------- scraper ----------
 async function runScrape(isbn) {
-  // Dynamically import Playwright AFTER env vars are set
-  const { chromium } = await import('playwright');
-
-  // 1) Launch browser (safe flags for containers)
-  let browser;
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
-  } catch (err) {
-    throw new Error('Failed to launch Chromium: ' + (err?.message || err));
-  }
-
+  const browser = await getBrowser();
   const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
   });
   const page = await context.newPage();
 
@@ -64,145 +89,140 @@ async function runScrape(isbn) {
     else route.continue();
   });
 
-  try {
-    await page.goto(`https://www.goodreads.com/search?q=${encodeURIComponent(isbn)}`, {
-      timeout: 30000,
-      waitUntil: 'domcontentloaded',
-    });
-
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      await page.locator('[class*="Overlay__close"], button[aria-label="Close"]').first().click({ timeout: 3500 });
-    } catch {}
+      await page.goto(`https://www.goodreads.com/search?q=${encodeURIComponent(isbn)}`, {
+        timeout: 30000, waitUntil: 'domcontentloaded',
+      });
 
-    if (!page.url().includes('/book/show/')) {
-      const first = page.locator('a[href*="/book/show/"]:not([href*="/reviews"])').first();
-      await first.waitFor({ state: 'visible', timeout: 10000 });
-      await first.click();
-      await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-    }
+      try { await page.locator('[class*="Overlay__close"], button[aria-label="Close"]').first().click({ timeout: 3000 }); } catch {}
 
-    const openDetails = (async () => {
-      const visible = await page
-        .locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]')
-        .first()
-        .isVisible()
-        .catch(() => false);
-      if (visible) return true;
-
-      const labels = [/book details & editions/i, /book details and editions/i, /book details/i, /details/i, /editions/i];
-      for (const rx of labels) {
-        const btn = page.locator('button', { hasText: rx }).first();
-        try {
-          await btn.waitFor({ state: 'visible', timeout: 1000 });
-          await btn.click({ timeout: 800 });
-          await page.waitForTimeout(400);
-          const opened = await Promise.race([
-            page.waitForSelector('[data-testid="bookDetails"]', { timeout: 800 }).then(() => true).catch(() => false),
-            page.waitForSelector('dt:has-text("Published") + dd', { timeout: 800 }).then(() => true).catch(() => false),
-            page.waitForSelector('dt:has-text("Original title") + dd', { timeout: 800 }).then(() => true).catch(() => false),
-          ]);
-          if (opened) return true;
-        } catch {}
+      if (!page.url().includes('/book/show/')) {
+        const first = page.locator('a[href*="/book/show/"]:not([href*="/reviews"])').first();
+        await first.waitFor({ state: 'visible', timeout: 10000 });
+        await first.click();
+        await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
       }
-      return false;
-    })();
 
-    const [
-      title, author, ratingValue, ratingsCountText, descriptionRaw, genres,
-      formatText, language, seriesText, ogCover, ldjsonScripts,
-      sub1, sub2, sub3, sub4
-    ] = await Promise.all([
-      page.locator('h1[data-testid="bookTitle"]').textContent({ timeout: 1500 }).catch(() => null),
-      page.locator('.ContributorLink__name').first().textContent({ timeout: 1500 }).catch(() => null),
-      page.locator('.RatingStatistics__rating').first().textContent({ timeout: 1200 }).catch(() => null),
-      page.locator('[data-testid="ratingsCount"]').first().textContent({ timeout: 1200 }).catch(() => null),
-      page.locator('[data-testid="description"] [data-testid="contentContainer"]').first().textContent({ timeout: 1500 }).catch(() => null),
-      page.locator('[data-testid="genresList"] .Button__labelItem').allTextContents().catch(() => []),
-      page.locator('dt:has-text("Format") + dd').textContent({ timeout: 1200 }).catch(() => null),
-      page.locator('dt:has-text("Language") + dd').textContent({ timeout: 1200 }).catch(() => null),
-      page.locator('dt:has-text("Series") + dd a').textContent({ timeout: 1200 }).catch(() => null),
-      page.locator('meta[property="og:image"]').getAttribute('content').catch(() => null),
-      page.locator('script[type="application/ld+json"]').allTextContents().catch(() => []),
-      page.locator('[data-testid="bookSubtitle"]').textContent({ timeout: 800 }).catch(() => null),
-      page.locator('.BookPageTitleSection__subtitle').textContent({ timeout: 800 }).catch(() => null),
-      page.locator('.BookPageTitleSection__title h3').first().textContent({ timeout: 800 }).catch(() => null),
-      page.locator('[data-testid="bookPageTitleSection"] h3').first().textContent({ timeout: 800 }).catch(() => null),
-    ]);
-
-    let subtitle = clean(sub1) || clean(sub2) || clean(sub3) || clean(sub4);
-
-    // JSON-LD → publishedfull
-    let publishedfull = null;
-    try {
-      const blobs = (ldjsonScripts || []).map(t => { try { return JSON.parse(t); } catch { return null; } }).filter(Boolean);
-      const flat = [];
-      const flatten = (o) => { if (Array.isArray(o)) return o.forEach(flatten); if (o && typeof o === 'object') { flat.push(o); for (const v of Object.values(o)) flatten(v); } };
-      blobs.forEach(flatten);
-      const isBookType = (t) => typeof t === 'string' && /\bBook\b/i.test(t);
-      const bookObj = flat.find(o => o && (isBookType(o['@type']) || (Array.isArray(o['@type']) && o['@type'].some(isBookType))));
-      if (bookObj) {
-        const dateText = fmtISO(clean(bookObj.datePublished));
-        let publisherName = null;
-        const pub = bookObj.publisher;
-        if (typeof pub === 'string') publisherName = clean(pub);
-        else if (pub && typeof pub === 'object') {
-          publisherName = Array.isArray(pub)
-            ? clean(pub.find(p => p && (p.name || typeof p === 'string'))?.name || pub.find(p => typeof p === 'string'))
-            : clean(pub.name);
+      const openDetails = (async () => {
+        const visible = await page
+          .locator('dt:has-text("Original title") + dd, dt:has-text("Published") + dd, [data-testid="bookDetails"]')
+          .first().isVisible().catch(() => false);
+        if (visible) return true;
+        const labels = [/book details & editions/i,/book details and editions/i,/book details/i,/details/i,/editions/i];
+        for (const rx of labels) {
+          const btn = page.locator('button', { hasText: rx }).first();
+          try {
+            await btn.waitFor({ state: 'visible', timeout: 1000 });
+            await btn.click({ timeout: 800 });
+            await page.waitForTimeout(400);
+            const opened = await Promise.race([
+              page.waitForSelector('[data-testid="bookDetails"]', { timeout: 800 }).then(() => true).catch(() => false),
+              page.waitForSelector('dt:has-text("Published") + dd', { timeout: 800 }).then(() => true).catch(() => false),
+              page.waitForSelector('dt:has-text("Original title") + dd', { timeout: 800 }).then(() => true).catch(() => false),
+            ]);
+            if (opened) return true;
+          } catch {}
         }
-        if (dateText && publisherName) publishedfull = `${dateText} by ${publisherName}`;
-        else if (dateText) publishedfull = dateText;
-      }
-    } catch {}
+        return false;
+      })();
 
-    await Promise.race([openDetails, new Promise(r => setTimeout(r, 1000))]);
+      const [
+        title, author, ratingValue, ratingsCountText, descriptionRaw, genres,
+        formatText, language, seriesText, ogCover, ldjsonScripts,
+        sub1, sub2, sub3, sub4
+      ] = await Promise.all([
+        page.locator('h1[data-testid="bookTitle"]').textContent({ timeout: 1500 }).catch(() => null),
+        page.locator('.ContributorLink__name').first().textContent({ timeout: 1500 }).catch(() => null),
+        page.locator('.RatingStatistics__rating').first().textContent({ timeout: 1200 }).catch(() => null),
+        page.locator('[data-testid="ratingsCount"]').first().textContent({ timeout: 1200 }).catch(() => null),
+        page.locator('[data-testid="description"] [data-testid="contentContainer"]').first().textContent({ timeout: 1500 }).catch(() => null),
+        page.locator('[data-testid="genresList"] .Button__labelItem').allTextContents().catch(() => []),
+        page.locator('dt:has-text("Format") + dd').textContent({ timeout: 1200 }).catch(() => null),
+        page.locator('dt:has-text("Language") + dd').textContent({ timeout: 1200 }).catch(() => null),
+        page.locator('dt:has-text("Series") + dd a').textContent({ timeout: 1200 }).catch(() => null),
+        page.locator('meta[property="og:image"]').getAttribute('content').catch(() => null),
+        page.locator('script[type="application/ld+json"]').allTextContents().catch(() => []),
+        page.locator('[data-testid="bookSubtitle"]').textContent({ timeout: 800 }).catch(() => null),
+        page.locator('.BookPageTitleSection__subtitle').textContent({ timeout: 800 }).catch(() => null),
+        page.locator('.BookPageTitleSection__title h3').first().textContent({ timeout: 800 }).catch(() => null),
+        page.locator('[data-testid="bookPageTitleSection"] h3').first().textContent({ timeout: 800 }).catch(() => null),
+      ]);
 
-    const [originaltitleRaw, publishedCandidates] = await Promise.all([
-      page.locator('dt:has-text("Original title") + dd [data-testid="contentContainer"]').textContent({ timeout: 1000 })
-        .catch(() => page.locator('dt:has-text("Original title") + dd').textContent({ timeout: 900 }).catch(() => null)),
-      publishedfull ? Promise.resolve([]) : page.locator('dt:has-text("Published") + dd').allTextContents().catch(() => []),
-    ]);
+      let subtitle = clean(sub1) || clean(sub2) || clean(sub3) || clean(sub4);
 
-    if (!publishedfull && publishedCandidates?.length) {
-      const cleaned = publishedCandidates.map(t => clean(t)).filter(Boolean).filter(t => !/^First published/i.test(t));
-      const withBy = cleaned.find(t => /\sby\s/i.test(t));
-      publishedfull = withBy || cleaned[cleaned.length - 1] || null;
-    }
-
-    if (!publishedfull) {
+      // JSON-LD → publishedfull
+      let publishedfull = null;
       try {
-        const txt = await page.locator('body').innerText();
-        const hit = (txt || '').split('\n').map(s => s.trim()).find(l => /[A-Za-z]+\s+\d{1,2},\s*\d{4}\s+by\s+.+/i.test(l));
-        if (hit) {
-          const m = hit.match(/([A-Za-z]+\s+\d{1,2},\s*\d{4}\s+by\s+.+)$/i);
-          if (m && m[1]) publishedfull = m[1].replace(/[•·]\s*.*$/, '').trim();
+        const blobs = (ldjsonScripts || []).map(t => { try { return JSON.parse(t); } catch { return null; } }).filter(Boolean);
+        const flat = []; const flatten = (o) => { if (Array.isArray(o)) return o.forEach(flatten); if (o && typeof o === 'object') { flat.push(o); for (const v of Object.values(o)) flatten(v); } };
+        blobs.forEach(flatten);
+        const isBookType = (t) => typeof t === 'string' && /\bBook\b/i.test(t);
+        const bookObj = flat.find(o => o && (isBookType(o['@type']) || (Array.isArray(o['@type']) && o['@type'].some(isBookType))));
+        if (bookObj) {
+          const dateText = fmtISO(clean(bookObj.datePublished));
+          let publisherName = null;
+          const pub = bookObj.publisher;
+          if (typeof pub === 'string') publisherName = clean(pub);
+          else if (pub && typeof pub === 'object') {
+            publisherName = Array.isArray(pub)
+              ? clean(pub.find(p => p && (p.name || typeof p === 'string'))?.name || pub.find(p => typeof p === 'string'))
+              : clean(pub.name);
+          }
+          if (dateText && publisherName) publishedfull = `${dateText} by ${publisherName}`;
+          else if (dateText) publishedfull = dateText;
         }
       } catch {}
+
+      await Promise.race([openDetails, new Promise(r => setTimeout(r, 1000))]);
+
+      const [originaltitleRaw, publishedCandidates] = await Promise.all([
+        page.locator('dt:has-text("Original title") + dd [data-testid="contentContainer"]').textContent({ timeout: 1000 })
+          .catch(() => page.locator('dt:has-text("Original title") + dd').textContent({ timeout: 900 }).catch(() => null)),
+        publishedfull ? Promise.resolve([]) : page.locator('dt:has-text("Published") + dd').allTextContents().catch(() => []),
+      ]);
+
+      if (!publishedfull && publishedCandidates?.length) {
+        const cleaned = publishedCandidates.map(t => clean(t)).filter(Boolean).filter(t => !/^First published/i.test(t));
+        const withBy = cleaned.find(t => /\sby\s/i.test(t));
+        publishedfull = withBy || cleaned[cleaned.length - 1] || null;
+      }
+
+      if (!publishedfull) {
+        try {
+          const txt = await page.locator('body').innerText();
+          const hit = (txt || '').split('\n').map(s => s.trim()).find(l => /[A-Za-z]+\s+\d{1,2},\s*\d{4}\s+by\s+.+/i.test(l));
+          if (hit) {
+            const m = hit.match(/([A-Za-z]+\s+\d{1,2},\s*\d{4}\s+by\s+.+)$/i);
+            if (m && m[1]) publishedfull = m[1].replace(/[•·]\s*.*$/, '').trim();
+          }
+        } catch {}
+      }
+
+      const details = {
+        isbn,
+        title: clean(title),
+        subtitle: subtitle || null,
+        originaltitle: clean(originaltitleRaw) || null,
+        author: clean(author),
+        cover: clean(ogCover) || null,
+        avgRating: (() => { const n = parseFloat(ratingValue); return Number.isNaN(n) ? undefined : n; })(),
+        ratingCount: (() => { const rc = parseInt((ratingsCountText||'').replace(/\D/g,''), 10); return Number.isNaN(rc) ? undefined : rc; })(),
+        description: clean(descriptionRaw)?.replace(/\s*\.{3}\s*more\s*$/i, '').trim() || null,
+        category: (() => {
+          const cleanedGenres = (genres||[]).map(g => clean(g)).filter(Boolean).filter(g => !/^\.\.\.more$/i.test(g));
+          return cleanedGenres.length ? cleanedGenres.join(', ') : undefined;
+        })(),
+        language: clean(language),
+        series: seriesText ? seriesText.replace(/\s*\(#\d+\.?\d*\)$/, '').trim() : undefined,
+        publishedfull: clean(publishedfull),
+      };
+
+      await context.close();
+      return details;
+    } catch (err) {
+      if (attempt === 2) { try { await context.close(); } catch {} throw err; }
+      await new Promise(r => setTimeout(r, 500));
     }
-
-    const details = {
-      isbn,
-      title: clean(title),
-      subtitle: subtitle || null,
-      originaltitle: clean(originaltitleRaw) || null,
-      author: clean(author),
-      cover: clean(ogCover) || null,
-      avgRating: (() => { const n = parseFloat(ratingValue); return Number.isNaN(n) ? undefined : n; })(),
-      ratingCount: (() => { const rc = parseInt((ratingsCountText||'').replace(/\D/g,''), 10); return Number.isNaN(rc) ? undefined : rc; })(),
-      description: clean(descriptionRaw)?.replace(/\s*\.{3}\s*more\s*$/i, '').trim() || null,
-      category: (() => {
-        const cleanedGenres = (genres||[]).map(g => clean(g)).filter(Boolean).filter(g => !/^\.\.\.more$/i.test(g));
-        return cleanedGenres.length ? cleanedGenres.join(', ') : undefined;
-      })(),
-      language: clean(language),
-      series: seriesText ? seriesText.replace(/\s*\(#\d+\.?\d*\)$/, '').trim() : undefined,
-      publishedfull: clean(publishedfull),
-    };
-
-    await browser.close();
-    return details;
-  } catch (err) {
-    try { await browser.close(); } catch {}
-    throw err;
   }
 }
